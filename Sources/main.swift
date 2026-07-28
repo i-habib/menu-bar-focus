@@ -12,8 +12,11 @@ import ServiceManagement
 // ============================================================
 
 let dayStartHour = 4                 // anything before 4am belongs to yesterday
-let pollInterval: TimeInterval = 2   // how often we sample the frontmost app
+let pollInterval: TimeInterval = 1   // UI tick (menu bar clock)
+let sampleInterval: TimeInterval = 2 // how often we actually sample the frontmost app
 let idleThreshold: TimeInterval = 60 // no input for this long = not wasting time
+let distractionGrace: TimeInterval = 15  // seconds on a waster before a session dies
+let idleStopAfter: TimeInterval = 600    // idle this long and the session ends
 
 // MARK: - Model
 
@@ -35,8 +38,27 @@ struct Habit: Codable {
     var name: String
 }
 
+/// A finished stretch of work on one habit.
+struct HabitSession: Codable {
+    var habitID: String
+    var dayKey: String
+    var start: Date
+    var end: Date
+    /// "manual", "distraction" (switched to a marked waster) or "idle"
+    var endedBy: String
+    var seconds: Double { max(0, end.timeIntervalSince(start)) }
+}
+
+/// The one currently running, if any.
+struct ActiveSession: Codable {
+    var habitID: String
+    var start: Date
+}
+
 struct Store: Codable {
     var habits: [Habit] = []
+    var sessions: [HabitSession] = []
+    var active: ActiveSession?
     /// dayKey -> habitID -> mark
     var logs: [String: [String: Int]] = [:]
     /// dayKey -> waste source key -> seconds
@@ -71,6 +93,13 @@ func dayKey(daysAgo n: Int) -> String {
 
 func pad(_ s: String, _ width: Int) -> String {
     s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
+}
+
+func clock(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds))
+    return s >= 3600
+        ? String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+        : String(format: "%d:%02d", s / 60, s % 60)
 }
 
 func mins(_ seconds: Double) -> String {
@@ -137,6 +166,62 @@ final class Storage {
         (store.waste[key] ?? [:]).values.reduce(0, +)
     }
 
+    // MARK: sessions
+
+    func habit(_ id: String) -> Habit? { store.habits.first { $0.id == id } }
+
+    func name(ofHabit id: String) -> String { habit(id)?.name ?? "(deleted habit)" }
+
+    /// Recorded time for a habit on a day, including the session running right now.
+    func trackedSeconds(day key: String, habitID: String) -> Double {
+        var total = store.sessions
+            .filter { $0.dayKey == key && $0.habitID == habitID }
+            .reduce(0) { $0 + $1.seconds }
+        if let a = store.active, a.habitID == habitID, dayKey(for: a.start) == key {
+            total += Date().timeIntervalSince(a.start)
+        }
+        return total
+    }
+
+    func trackedSeconds(day key: String) -> Double {
+        store.habits.reduce(0) { $0 + trackedSeconds(day: key, habitID: $1.id) }
+    }
+
+    var activeElapsed: Double? {
+        guard let a = store.active else { return nil }
+        return Date().timeIntervalSince(a.start)
+    }
+
+    func startSession(habitID: String) {
+        endSession(reason: "manual")
+        var s = store
+        s.active = ActiveSession(habitID: habitID, start: Date())
+        store = s
+        flush()
+    }
+
+    /// Ends the running session. `at` lets the caller back-date the end to the
+    /// moment the distraction (or the idling) actually started.
+    @discardableResult
+    func endSession(reason: String, at end: Date = Date()) -> HabitSession? {
+        guard let a = store.active else { return nil }
+        var s = store
+        s.active = nil
+        let clamped = max(a.start, end)
+        var recorded: HabitSession?
+        // Anything under 10 seconds is a misclick, not a session.
+        if clamped.timeIntervalSince(a.start) >= 10 {
+            let session = HabitSession(habitID: a.habitID,
+                                       dayKey: dayKey(for: a.start),
+                                       start: a.start, end: clamped, endedBy: reason)
+            s.sessions.append(session)
+            recorded = session
+        }
+        store = s
+        flush()
+        return recorded
+    }
+
     /// Consecutive days ending today (or yesterday, if today isn't logged yet)
     /// on which at least one habit was done.
     var currentStreak: Int {
@@ -177,6 +262,7 @@ final class WasteTracker {
     static let shared = WasteTracker()
 
     private var lastPoll = Date()
+    private var lastResolve = Date.distantPast
     private(set) var currentKey: String?
     private(set) var currentName: String?
 
@@ -195,14 +281,19 @@ final class WasteTracker {
         lastPoll = now
         guard elapsed > 0 else { return }
 
-        resolveCurrent()
+        // Asking the browser for its front tab is the expensive part, so that
+        // runs on its own slower cadence than the menu bar clock.
+        if now.timeIntervalSince(lastResolve) >= sampleInterval {
+            lastResolve = now
+            resolveCurrent()
+        }
 
         // Only count time you were actually present for.
         guard idleSeconds() < idleThreshold else { return }
         guard let key = currentKey, Storage.shared.store.wasters[key] != nil else { return }
 
         // Clamp so a sleep or a stalled timer can't dump an hour into the log.
-        let credit = min(elapsed, pollInterval * 2)
+        let credit = min(elapsed, sampleInterval * 2)
         let day = dayKey()
         var store = Storage.shared.store
         store.waste[day, default: [:]][key, default: 0] += credit
@@ -242,12 +333,80 @@ final class WasteTracker {
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
-    private func idleSeconds() -> TimeInterval {
+    var isOnWaster: Bool {
+        guard let key = currentKey else { return false }
+        return Storage.shared.store.wasters[key] != nil
+    }
+
+    func idleSeconds() -> TimeInterval {
         let types: [CGEventType] = [.mouseMoved, .keyDown, .leftMouseDown,
                                     .rightMouseDown, .scrollWheel, .flagsChanged]
         return types.compactMap {
             CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0)
         }.min() ?? 0
+    }
+}
+
+// MARK: - Toast
+
+/// A small non-blocking HUD near the menu bar. Deliberately not a system
+/// notification: no permission prompts, no Notification Centre clutter.
+enum Toast {
+    private static var window: NSWindow?
+    private static var timer: Timer?
+
+    static func show(title: String, body: String) {
+        timer?.invalidate()
+        window?.orderOut(nil)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .white
+        let bodyLabel = NSTextField(labelWithString: body)
+        bodyLabel.font = .systemFont(ofSize: 12)
+        bodyLabel.textColor = NSColor(white: 0.75, alpha: 1)
+
+        let stack = NSStackView(views: [titleLabel, bodyLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
+        container.layer?.cornerRadius = 12
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        let size = stack.fittingSize
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let frame = NSRect(x: screen.visibleFrame.maxX - size.width - 20,
+                           y: screen.visibleFrame.maxY - size.height - 20,
+                           width: size.width, height: size.height)
+
+        let win = NSWindow(contentRect: frame, styleMask: .borderless,
+                           backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.level = .statusBar
+        win.ignoresMouseEvents = true
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        win.contentView = container
+        win.orderFrontRegardless()
+        window = win
+
+        NSSound.beep()
+        timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { _ in
+            window?.orderOut(nil)
+            window = nil
+        }
     }
 }
 
@@ -415,8 +574,27 @@ final class StatsWindowController {
             }
             let total = small + deep
             let rate = logged.isEmpty ? 0 : Int(Double(total) / Double(logged.count) * 100)
+            let habitSessions = s.store.sessions.filter { $0.habitID == habit.id }
+            let recorded = habitSessions.reduce(0.0) { $0 + $1.seconds }
             lines.append("\(pad(habit.name, 18))\(pad("\(total) done", 10))"
-                         + "\(pad("\(deep) deep", 10))\(rate)%")
+                         + "\(pad("\(deep) deep", 10))\(pad("\(rate)%", 7))"
+                         + (recorded > 0 ? mins(recorded) : ""))
+        }
+
+        // sessions
+        let sessions = s.store.sessions
+        if !sessions.isEmpty {
+            let recorded = sessions.reduce(0.0) { $0 + $1.seconds }
+            let killed = sessions.filter { $0.endedBy == "distraction" }.count
+            let walked = sessions.filter { $0.endedBy == "idle" }.count
+            let longest = sessions.map(\.seconds).max() ?? 0
+            lines.append("")
+            lines.append("Sessions recorded  \(sessions.count)")
+            lines.append("Time recorded      \(mins(recorded))")
+            lines.append("Average session    \(mins(recorded / Double(sessions.count)))")
+            lines.append("Longest session    \(mins(longest))")
+            lines.append("Killed by distraction  \(killed)")
+            lines.append("Ended by walking off   \(walked)")
         }
 
         // waste, last 7 days
@@ -492,7 +670,15 @@ final class CheckInController: NSObject {
             let seg = NSSegmentedControl(labels: Mark.allCases.map(\.label),
                                          trackingMode: .selectOne,
                                          target: nil, action: nil)
-            seg.selectedSegment = existing[habit.id] ?? 0
+            // Recorded sessions pre-answer the question; you can still override.
+            let tracked = Storage.shared.trackedSeconds(day: key, habitID: habit.id)
+            let suggested = tracked >= 3600 ? 2 : (tracked >= 300 ? 1 : 0)
+            seg.selectedSegment = existing[habit.id] ?? suggested
+
+            if tracked > 0 {
+                name.stringValue = "\(habit.name)  ·  \(mins(tracked))"
+                name.toolTip = "Recorded \(mins(tracked)) of tracked sessions"
+            }
             seg.segmentDistribution = .fillEqually
             seg.widthAnchor.constraint(equalToConstant: 250).isActive = true
 
@@ -624,6 +810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let stats = StatsWindowController()
     private var timer: Timer?
     private var lastPromptedDay = ""
+    private var wasteRunSince: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -633,18 +820,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
+        // A session left running by a crash or a force quit is stale — drop it
+        // rather than crediting hours nobody worked.
+        if let active = Storage.shared.store.active,
+           Date().timeIntervalSince(active.start) > 6 * 3600 {
+            Storage.shared.endSession(reason: "interrupted", at: active.start)
+        }
+
         var ticks = 0
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             WasteTracker.shared.tick()
+            self?.policeActiveSession()
             self?.updateStatusItem()
             self?.maybePromptCheckIn()
             ticks += 1
-            if ticks % 15 == 0 { Storage.shared.flush() }   // ~every 30s
+            if ticks % 30 == 0 { Storage.shared.flush() }   // ~every 30s
         }
         timer?.tolerance = 0.5
 
         updateStatusItem()
         maybePromptCheckIn()
+    }
+
+    // MARK: session auto-stop
+
+    /// A running session dies when you spend a sustained moment on something you
+    /// yourself marked as wasted time, or when you walk away.
+    private func policeActiveSession() {
+        guard Storage.shared.store.active != nil else {
+            wasteRunSince = nil
+            return
+        }
+
+        // Walked away: end the session where the idling began, not now.
+        let idle = WasteTracker.shared.idleSeconds()
+        if idle >= idleStopAfter {
+            let began = Date().addingTimeInterval(-idle)
+            if let done = Storage.shared.endSession(reason: "idle", at: began) {
+                announce(title: "Session ended — you stepped away",
+                         body: "\(Storage.shared.name(ofHabit: done.habitID)) · \(mins(done.seconds))")
+            }
+            wasteRunSince = nil
+            return
+        }
+
+        guard WasteTracker.shared.isOnWaster else {
+            wasteRunSince = nil
+            return
+        }
+
+        // A glance is forgiven; sinking into it is not.
+        let since = wasteRunSince ?? Date()
+        wasteRunSince = since
+        guard Date().timeIntervalSince(since) >= distractionGrace else { return }
+
+        let distraction = WasteTracker.shared.currentName ?? "a distraction"
+        if let done = Storage.shared.endSession(reason: "distraction", at: since) {
+            announce(title: "Session stopped — \(distraction)",
+                     body: "\(Storage.shared.name(ofHabit: done.habitID)) · \(mins(done.seconds))")
+        }
+        wasteRunSince = nil
+    }
+
+    private func announce(title: String, body: String) {
+        Toast.show(title: title, body: body)
     }
 
     // MARK: status item — the always-present waste bar
@@ -656,9 +895,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fraction = budget > 0 ? min(1, wasted / budget) : 0
 
         button.image = barImage(fraction: fraction)
+        button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+
+        // A running session takes over the text; the waste bar stays either way.
+        if let active = Storage.shared.store.active, let elapsed = Storage.shared.activeElapsed {
+            let name = Storage.shared.name(ofHabit: active.habitID)
+            button.title = " ▶ \(name.prefix(14))  \(clock(elapsed))"
+            return
+        }
         let streak = Storage.shared.currentStreak
         button.title = streak > 0 ? " \(mins(wasted))  🔥\(streak)" : " \(mins(wasted))"
-        button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
     }
 
     private func barImage(fraction: Double) -> NSImage {
@@ -718,6 +964,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showStats() { stats.show() }
     @objc private func editHabits() {
         habits.show { [weak self] in self?.updateStatusItem() }
+    }
+
+    // MARK: sessions
+
+    @objc private func startSession(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        wasteRunSince = nil
+        Storage.shared.startSession(habitID: id)
+        updateStatusItem()
+    }
+
+    @objc private func endSessionNow() {
+        if let done = Storage.shared.endSession(reason: "manual") {
+            Toast.show(title: "Session logged",
+                       body: "\(Storage.shared.name(ofHabit: done.habitID)) · \(mins(done.seconds))")
+        }
+        updateStatusItem()
+        stats.refresh()
     }
 
     // MARK: wasters
@@ -808,6 +1072,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        // Session controls
+        if let active = s.store.active, let elapsed = s.activeElapsed {
+            header(menu, "▶ \(s.name(ofHabit: active.habitID))  ·  \(clock(elapsed))")
+            add(menu, "End session", #selector(endSessionNow))
+        } else if s.store.habits.isEmpty {
+            header(menu, "Add a habit to start a session")
+        } else {
+            let start = NSMenuItem(title: "Start a session", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for habit in s.store.habits {
+                let item = NSMenuItem(title: habit.name, action: #selector(startSession(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = habit.id
+                let today = s.trackedSeconds(day: dayKey(), habitID: habit.id)
+                if today > 0 { item.title = "\(habit.name)  ·  \(mins(today)) today" }
+                sub.addItem(item)
+            }
+            start.submenu = sub
+            menu.addItem(start)
+        }
+
+        let tracked = s.trackedSeconds(day: dayKey())
+        if tracked > 0 { header(menu, "Tracked today: \(mins(tracked))") }
+
+        menu.addItem(.separator())
+
         let streak = s.currentStreak
         header(menu, streak > 0 ? "🔥 \(streak) day streak" : "No streak — log a day")
         add(menu, s.isLogged(dayKey()) ? "Edit today's check-in…" : "Check in for today…",
@@ -869,6 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Storage.shared.endSession(reason: "manual")
         Storage.shared.flush()
     }
 }

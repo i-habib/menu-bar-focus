@@ -15,9 +15,29 @@ with three honest options:
 The check-in pops up at your chosen hour (default 21:00). If a day slips by unlogged,
 it asks about it the next morning instead of silently losing it.
 
+**Live sessions.** Start a session on any habit from the menu and the menu bar becomes a
+running clock (`▶ Deep work 42:15`). It ends three ways:
+
+- **You end it** — *End session* in the menu.
+- **You get distracted** — 15 continuous seconds on anything you marked as time wasted
+  kills it, and the recorded time is backdated to the moment you switched away, not to
+  when you noticed. A quick glance is forgiven; sinking into it isn't.
+- **You walk away** — 10 minutes without keyboard or mouse ends it, trimmed back to when
+  you stopped.
+
+Each ending shows a small HUD with what got logged. Sessions under 10 seconds are
+discarded as misclicks, and a session left running by a crash is dropped rather than
+credited.
+
+Recorded time then **pre-answers the check-in**: an hour or more preselects *1 hr deep*,
+five minutes or more preselects *5 min+*. You can always override it — the tracker is a
+memory aid, not a judge.
+
 **The chart.** A GitHub-style contribution grid, ~6 months at a glance, shaded by how
 much of the day's possible credit you earned. Plus current streak, longest streak,
-per-habit totals and completion rate.
+per-habit totals, completion rate and recorded time. Session stats too: how many you
+recorded, total and average and longest length, how many died to a distraction, and how
+many you walked away from.
 
 **The time wasted bar.** Always in the menu bar: a small bar that fills green → orange
 → red against a daily budget you set, with the minutes next to it and your streak.
@@ -48,8 +68,8 @@ just get tracked as one app instead of per-site.
 
 ## Data
 
-One JSON file at `~/.focus/habits.json`: your habits, every day's marks, per-source
-wasted seconds, and your settings. Nothing leaves your machine, and nothing is recorded
+One JSON file at `~/.focus/habits.json`: your habits, every day's marks, every recorded
+session with its start, end and why it ended, per-source wasted seconds, and your settings. Nothing leaves your machine, and nothing is recorded
 about apps or sites you haven't explicitly marked.
 
 ## Notes
