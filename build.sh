@@ -22,6 +22,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleVersion</key>         <string>1</string>
     <key>LSMinimumSystemVersion</key>  <string>12.0</string>
     <key>LSUIElement</key>             <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Focus reads the address of your front browser tab so you can mark individual websites as time wasted. The address is never stored or sent anywhere — only the site name of sites you mark yourself.</string>
 </dict>
 </plist>
 PLIST

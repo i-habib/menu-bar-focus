@@ -1,48 +1,60 @@
 # Focus
 
-A small menu bar app for macOS. One idea: every day you name the one or two things
-that actually matter, and then you can't quietly forget them.
+A small macOS menu bar app for consistency. Two ideas, both from *Atomic Habits*:
+you can't improve what you don't measure, and the streak itself is the motivation.
 
 ## What it does
 
-- **4am day boundary.** The first time you use your Mac after 4am, a full-screen
-  screen you can't dismiss asks for your top 1–2 priorities and a start time for each.
-  No text, no continue.
-- **Lives in the menu bar.** The next priority and its time sit up there all day.
-  While a session is running it shows a live timer instead.
-- **Nudges.** 30 minutes before the start time, at the start time, and 30 and 60
-  minutes after, the screen is taken over for 5 seconds with the task in big letters.
-  Buttons: *I'm on it* / *Done* / *Dismiss*.
-- **Sessions.** Marking something "I'm working on it" starts a timer that runs until
-  you pause it or mark it finished. Only one can run at a time.
-- **Nudges stop** once a task is marked working or done — the guilt is only for
-  things you haven't touched.
-- **Stats.** Days planned, completion rate, on-time starts, session count, total
-  focused time, plus the last 30 days of history.
+**Habit tracking.** Keep a list of habits. Once a day the app asks how each one went,
+with three honest options:
+
+- **Didn't** — no credit
+- **5 min+** — you showed up (this is the one that matters)
+- **1 hr deep** — an undistracted hour
+
+The check-in pops up at your chosen hour (default 21:00). If a day slips by unlogged,
+it asks about it the next morning instead of silently losing it.
+
+**The chart.** A GitHub-style contribution grid, ~6 months at a glance, shaded by how
+much of the day's possible credit you earned. Plus current streak, longest streak,
+per-habit totals and completion rate.
+
+**The time wasted bar.** Always in the menu bar: a small bar that fills green → orange
+→ red against a daily budget you set, with the minutes next to it and your streak.
+Nothing is a time waster until you say so — open the menu while you're in the offending
+app and click **Mark "TikTok" as time wasted**. In Safari, Chrome, Brave or Arc it marks
+the *website* instead of the whole browser, so `youtube.com` counts and `docs.google.com`
+doesn't. Remove any of them from the *Time wasters* submenu.
+
+Time only accrues while the app is genuinely in front and you've touched the keyboard or
+mouse in the last minute — walking away doesn't count against you.
 
 ## Build
 
-Requires the Xcode command line tools (`xcode-select --install`). No other dependencies.
+Needs the Xcode command line tools (`xcode-select --install`). No other dependencies.
 
 ```sh
 ./build.sh --install
 ```
 
-That compiles `Focus.app`, copies it to `/Applications`, and launches it. Without
+Compiles `Focus.app`, installs it to `/Applications` and launches it. Without
 `--install` it just builds into `./build`.
 
-Then open the menu bar icon and turn on **Open at login** — the app has to be running
-for any of this to work.
+Then open the menu bar item and turn on **Open at login**.
+
+The first time you focus a browser, macOS asks for permission to control it — that's the
+tab-address read for site-level tracking. Deny it and everything still works; browsers
+just get tracked as one app instead of per-site.
 
 ## Data
 
-Everything is one JSON file at `~/.focus/state.json`: every day, every priority,
-every session's start and end. Nothing leaves your machine.
+One JSON file at `~/.focus/habits.json`: your habits, every day's marks, per-source
+wasted seconds, and your settings. Nothing leaves your machine, and nothing is recorded
+about apps or sites you haven't explicitly marked.
 
 ## Notes
 
-- The setup screen sits above the menu bar and the Dock and pulls focus back to
-  itself every second. It's stubborn by design, but it isn't a kernel-level lock —
-  quitting the app still works if you really want out.
-- Times before 4am count as belonging to the previous day, so a priority scheduled
-  for 01:00 fires tonight, not this morning.
+- The day rolls over at 4am, so a 1am session still counts as the previous day.
+- Renaming a habit starts its history fresh; the old name keeps its past entries.
+- Waste time is buffered in memory and written to disk every 30 seconds, so the tracker
+  isn't hammering your SSD every two seconds.
